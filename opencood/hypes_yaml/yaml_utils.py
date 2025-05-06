@@ -30,7 +30,7 @@ def load_yaml(file, opt=None):
     if opt and opt.model_dir:
         file = os.path.join(opt.model_dir, 'config.yaml')
 
-    stream = open(file, 'r')
+    stream = open(file, 'r', encoding='utf-8')
     loader = yaml.Loader
     loader.add_implicit_resolver(
         u'tag:yaml.org,2002:float',

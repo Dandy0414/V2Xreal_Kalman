@@ -2,8 +2,9 @@
 name: visualization
 
 yaml_parser: "load_voxel_params"
-root_dir: "opv2v_data_dumping/train"
-validate_dir: "opv2v_data_dumping/test"
+root_dir: "c:/Users/daehy/V2X-Real-main/data/v2xreal/train"
+validate_dir: "c:/Users/daehy/V2X-Real-main/data/v2xreal/test"
+dataset_mode: 'vc'  # 또는 'ic', 'v2v', 'i2i' 중 하나
 
 train_params:
   batch_size: &batch_size 4
@@ -47,6 +48,23 @@ postprocess:
     h: 1.56
     r: [0, 90]
     num: &achor_num 2
+    anchor_generator_config:  # 추가된 섹션
+      - class_name: 'vehicle'
+        anchor_sizes: [[3.9, 1.6, 1.56]]
+        anchor_rotations: [0, 1.57]
+        anchor_bottom_heights: [-1.78]
+        align_center: True
+        feature_map_stride: 2
+        matched_threshold: 0.6
+        unmatched_threshold: 0.45
+      - class_name: 'pedestrian'
+        anchor_sizes: [[0.8, 0.6, 1.73]]
+        anchor_rotations: [0, 1.57]
+        anchor_bottom_heights: [-0.6]
+        align_center: True
+        feature_map_stride: 2
+        matched_threshold: 0.5
+        unmatched_threshold: 0.35
   target_args:
     pos_threshold: 0.6
     neg_threshold: 0.45
