@@ -444,6 +444,7 @@ def visualize_single_sample_dataloader(batch_data,
                                        save_path='',
                                        oabb=False,
                                        mode='constant'):
+    
     """
     Visualize a single frame of a single CAV for validation of data pipeline.
 
@@ -489,10 +490,14 @@ def visualize_single_sample_dataloader(batch_data,
 
     object_bbx_center = batch_data['object_bbx_center']
     object_bbx_mask = batch_data['object_bbx_mask']
-    object_bbx_center = object_bbx_center[object_bbx_mask == 1]
+    object_bbx_center = object_bbx_center[object_bbx_mask > 0]
 
-    aabbs = bbx2linset(object_bbx_center, order) if not oabb else \
-        bbx2oabb(object_bbx_center, order)
+    # mask별 색상 지정 예시
+    colors = {1: (0, 1, 0), 2: (1, 0, 0), 3: (0, 0, 1)}  # 원하는 색상으로
+    aabbs = []
+    for box, mask in zip(object_bbx_center, object_bbx_mask[object_bbx_mask > 0]):
+        color = colors.get(int(mask), (1, 1, 0))  # 반드시 int(mask)로!
+        aabbs.extend(bbx2linset(box[np.newaxis, :], order, color=color))
     visualize_elements = [o3d_pcd] + aabbs
     if visualize:
         o3d.visualization.draw_geometries(visualize_elements)
@@ -646,6 +651,7 @@ def visualize_inference_sample_dataloader(pred_box_tensor,
 
 
 def visualize_sequence_dataloader(dataloader, order, color_mode='constant'):
+
     """
     Visualize the batch data in animation.
 
