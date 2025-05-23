@@ -11,7 +11,7 @@ from opencood.utils.transformation_utils import x_to_world
 lidar_folder = 'data/test여분/2023-04-07-15-02-15_1_1/1'
 
 
-def get_vehicle_bbox(yaml_path, vehicle_id=4):
+def get_vehicle_bbox(yaml_path, vehicle_id=0):
     with open(yaml_path, 'r') as f:
         data = yaml.safe_load(f)
     vehicles = data.get('vehicles', {})
@@ -26,7 +26,7 @@ def get_vehicle_bbox(yaml_path, vehicle_id=4):
     x, y, z = veh['location']
     l, w, h = veh['extent']
     yaw = veh['angle'][2]
-    bbox = np.array([[x, y, z, h, w, l, yaw]], dtype=np.float32)
+    bbox = np.array([[x, y, z, 2*h, 2*w, 2*l, yaw]], dtype=np.float32)
     return bbox
 
 
@@ -55,7 +55,7 @@ class DummyDataset(Dataset):
         pose = data.get('true_ego_pose', None)
         if pose is not None:
             lidar = transform_lidar_to_world(lidar, pose)
-        bbx_center = get_vehicle_bbox(self.yaml_files[idx])
+        bbx_center = get_vehicle_bbox(self.yaml_files[idx])  #차량번호 입력
         bbx_mask = np.array([1], dtype=np.int32)
         return {
             'ego': {
