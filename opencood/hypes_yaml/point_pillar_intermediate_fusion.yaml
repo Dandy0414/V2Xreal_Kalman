@@ -1,6 +1,6 @@
 name: point_pillar_intermediate_fusion
-root_dir: "/data/v2xreal/train"
-validate_dir: "/data/v2xreal/test"
+root_dir: "c:/Users/daehy/V2X-Real-main/data/v2xreal/train"
+validate_dir: "c:/Users/daehy/V2X-Real-main/data/v2xreal/test"
 dataset_mode: 'vc'
 
 yaml_parser: "load_point_pillar_params"

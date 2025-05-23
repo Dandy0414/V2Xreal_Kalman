@@ -29,7 +29,7 @@ if __name__ == '__main__':
 
     opencda_dataset = EarlyFusionVisDataset(params, visualize=True,
                                             train=False)
-    data_loader = DataLoader(opencda_dataset, batch_size=1, num_workers=8,
+    data_loader = DataLoader(opencda_dataset, batch_size=1, num_workers=0,
                              collate_fn=opencda_dataset.collate_batch_train,
                              shuffle=False,
                              pin_memory=False)
