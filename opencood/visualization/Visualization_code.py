@@ -4,11 +4,12 @@ from opencood.visualization.vis_utils import visualize_sequence_dataloader, o3d
 import glob
 import os
 import yaml
+import random
 
 from opencood.utils.pcd_utils import load_lidar_bin
 from opencood.utils.transformation_utils import x_to_world
 
-lidar_folder = 'd:/데이터파일/BIN/test/2023-03-17-16-12-12_3_0/-2'
+lidar_folder = 'd:/데이터파일/OPV2V/test/testoutput_CAV_data_2022-03-21-09-35-07_7/1'
 vehicle_ID = None  # None이면 전체 차량, 특정 ID를 지정하면 해당 차량만
 
 def transform_lidar_to_world(lidar, pose):
@@ -31,8 +32,8 @@ class KalmanFilter:
             self.A[i, i+4] = dt  # 위치/방향에 속도/각속도 반영
         self.Q = np.eye(8) * 0.1  # 프로세스 노이즈
         self.H = np.eye(4, 8)      # 관측 행렬 (x, y, z, yaw만 관측)
-        self.R = np.eye(4) * 0.1   # 관측 노이즈
-        self.R[3, 3] = 30.0 
+        self.R = np.eye(4) * 1   # 관측 노이즈
+        self.R[3, 3] = 5
 
     def predict(self):
         self.x = self.A @ self.x
@@ -45,11 +46,22 @@ class KalmanFilter:
         self.P = (np.eye(8) - K @ self.H) @ self.P
 
 
-def get_all_vehicle_bboxes(yaml_path, vehicle_id=None):
+def get_all_vehicle_bboxes(yaml_path, vehicle_id=None, noise_std=0.05, big_noise_std=0.4, big_noise_prob=0.05):
     with open(yaml_path, 'r') as f:
         data = yaml.load(f, Loader=yaml.UnsafeLoader) 
     vehicles = data.get('vehicles', {})
     bboxes = {}
+    def add_noise(bbox):
+        bbox[:3] += np.random.normal(0, noise_std, 3)
+        bbox[6] += np.random.normal(0, noise_std)
+        # 각 상태변수별로 big_noise_prob 확률로 큰 노이즈 추가
+        for i in range(3):  # x, y, z
+            if random.random() < big_noise_prob:
+                bbox[i] += np.random.normal(0, big_noise_std)*2
+        if random.random() < big_noise_prob:  # yaw
+            bbox[6] += np.random.normal(0, big_noise_std)
+        return bbox
+
     if vehicle_id is not None:
         vid_str = str(vehicle_id)
         if vid_str in vehicles:
@@ -62,6 +74,7 @@ def get_all_vehicle_bboxes(yaml_path, vehicle_id=None):
         l, w, h = veh['extent']
         yaw = np.deg2rad(veh['angle'][1])
         bbox = np.array([x, y, z, 2*h, 2*w, 2*l, yaw], dtype=np.float32)
+        bbox = add_noise(bbox)
         bboxes[vid_str] = bbox
     else:
         for vid, veh in vehicles.items():
@@ -69,19 +82,25 @@ def get_all_vehicle_bboxes(yaml_path, vehicle_id=None):
             l, w, h = veh['extent']
             yaw = np.deg2rad(veh['angle'][1])
             bbox = np.array([x, y, z, 2*h, 2*w, 2*l, yaw], dtype=np.float32)
+            bbox = add_noise(bbox)
             bboxes[str(vid)] = bbox
     return bboxes  # {vehicle_id: bbox, ...}
 
+# DummyDataset에서 mode 4, 5 관련 코드는 모두 삭제
 class DummyDataset(Dataset):
-    def __init__(self, folder, vehicle_id=None, mode=3):
+    def __init__(self, folder, vehicle_id=None, mode=3, noise_std=0.05, big_noise_std=0.4, big_noise_prob=0.05):
         self.bin_files = sorted(glob.glob(os.path.join(folder, '*.bin')))
         self.pcd_files = sorted(glob.glob(os.path.join(folder, '*.pcd')))
         self.yaml_files = sorted(glob.glob(os.path.join(folder, '*.yaml')))
         self.vehicle_id = vehicle_id
         self.mode = mode  # 1: 정답만, 2: 칼만만, 3: 둘 다
+        self.noise_std = noise_std
+        self.big_noise_std = big_noise_std
+        self.big_noise_prob = big_noise_prob
         self.files = self.bin_files + self.pcd_files
         self.files.sort()
-        first_bboxes = get_all_vehicle_bboxes(self.yaml_files[0], vehicle_id)
+        first_bboxes = get_all_vehicle_bboxes(
+            self.yaml_files[0], vehicle_id, self.noise_std, self.big_noise_std, self.big_noise_prob)
         self.vehicle_ids = list(first_bboxes.keys())
         self.kf_dict = {}
         self.size_dict = {}
@@ -112,12 +131,12 @@ class DummyDataset(Dataset):
         pose = data.get('true_ego_pose', None)
         if pose is not None:
             lidar = transform_lidar_to_world(lidar, pose)
-        bboxes = get_all_vehicle_bboxes(self.yaml_files[yaml_idx], self.vehicle_id)
+        bboxes = get_all_vehicle_bboxes(
+            self.yaml_files[yaml_idx], self.vehicle_id, self.noise_std, self.big_noise_std, self.big_noise_prob)
 
         all_boxes = []
         all_masks = []
         for i, (vid, bbox) in enumerate(bboxes.items()):
-            print(f"Vehicle {vid} yaw(raw):", bbox[6])
             kf = self.kf_dict.get(vid)
             if kf is None:
                 x, y, z, h, w, l, yaw = bbox
@@ -156,6 +175,12 @@ class DummyDataset(Dataset):
 
 if __name__ == "__main__":
     # mode: 1=정답만, 2=칼만만, 3=둘다
-    mode = 1  # 원하는 모드로 변경
-    dummy_loader = DataLoader(DummyDataset(lidar_folder, vehicle_id=vehicle_ID, mode=mode), batch_size=1)
+    mode = 2
+    dummy_loader = DataLoader(
+        DummyDataset(
+            lidar_folder, vehicle_id=vehicle_ID, mode=mode,
+            noise_std=0.05, big_noise_std=0.4, big_noise_prob=0.05
+            # noise_std=0, big_noise_std=0, big_noise_prob=0
+
+        ), batch_size=1)
     visualize_sequence_dataloader(dummy_loader, order='hwl', color_mode='constant')
