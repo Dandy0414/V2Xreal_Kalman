@@ -1,6 +1,6 @@
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
-from opencood.visualization.vis_utils import visualize_sequence_dataloader, bbx2linset, o3d
+from opencood.visualization.vis_utils import visualize_sequence_dataloader, o3d
 import glob
 import os
 import yaml
@@ -8,7 +8,7 @@ import yaml
 from opencood.utils.pcd_utils import load_lidar_bin
 from opencood.utils.transformation_utils import x_to_world
 
-lidar_folder = 'd:/test/test/2023-03-17-16-12-12_3_0/1'
+lidar_folder = 'd:/데이터파일/BIN/test/2023-03-17-16-12-12_3_0/-2'
 vehicle_ID = None  # None이면 전체 차량, 특정 ID를 지정하면 해당 차량만
 
 def transform_lidar_to_world(lidar, pose):
@@ -60,14 +60,14 @@ def get_all_vehicle_bboxes(yaml_path, vehicle_id=None):
             raise ValueError(f"Vehicle ID {vehicle_id} not found in yaml.")
         x, y, z = veh['location']
         l, w, h = veh['extent']
-        yaw = veh['angle'][2]
+        yaw = np.deg2rad(veh['angle'][1])
         bbox = np.array([x, y, z, 2*h, 2*w, 2*l, yaw], dtype=np.float32)
         bboxes[vid_str] = bbox
     else:
         for vid, veh in vehicles.items():
             x, y, z = veh['location']
             l, w, h = veh['extent']
-            yaw = veh['angle'][2]
+            yaw = np.deg2rad(veh['angle'][1])
             bbox = np.array([x, y, z, 2*h, 2*w, 2*l, yaw], dtype=np.float32)
             bboxes[str(vid)] = bbox
     return bboxes  # {vehicle_id: bbox, ...}
@@ -117,6 +117,7 @@ class DummyDataset(Dataset):
         all_boxes = []
         all_masks = []
         for i, (vid, bbox) in enumerate(bboxes.items()):
+            print(f"Vehicle {vid} yaw(raw):", bbox[6])
             kf = self.kf_dict.get(vid)
             if kf is None:
                 x, y, z, h, w, l, yaw = bbox
@@ -155,6 +156,6 @@ class DummyDataset(Dataset):
 
 if __name__ == "__main__":
     # mode: 1=정답만, 2=칼만만, 3=둘다
-    mode = 2  # 원하는 모드로 변경
+    mode = 1  # 원하는 모드로 변경
     dummy_loader = DataLoader(DummyDataset(lidar_folder, vehicle_id=vehicle_ID, mode=mode), batch_size=1)
     visualize_sequence_dataloader(dummy_loader, order='hwl', color_mode='constant')
