@@ -492,11 +492,31 @@ def visualize_single_sample_dataloader(batch_data,
     object_bbx_mask = batch_data['object_bbx_mask']
     object_bbx_center = object_bbx_center[object_bbx_mask > 0]
 
-    # mask별 색상 지정 예시
-    colors = {1: (0, 1, 0), 2: (1, 0, 0), 3: (0, 0, 1)}  # 원하는 색상으로
+    # 더 다양한 색상 리스트 (칼만필터용)
+    kf_colors = [
+        (1, 0, 0),      # 빨강
+        (0, 0, 1),      # 파랑
+        (1, 0.5, 0),    # 주황
+        (0.5, 0, 1),    # 보라
+        (0, 1, 1),      # 청록
+        (1, 0, 1),      # 핑크
+        (0.5, 0.5, 0),  # 올리브
+        (0, 0.5, 0.5),  # 남색
+        (0.7, 0.3, 0.2),# 갈색
+        (0.3, 0.7, 0.2),# 연두
+        (0.2, 0.3, 0.7),# 남보라
+        (0.8, 0.2, 0.5),# 연분홍
+        (0.2, 0.8, 0.5),# 민트
+        (0.5, 0.2, 0.8),# 연보라
+        (0.9, 0.6, 0.1),# 금색
+        (0.1, 0.9, 0.6),# 청록2
+    ]
     aabbs = []
     for box, mask in zip(object_bbx_center, object_bbx_mask[object_bbx_mask > 0]):
-        color = colors.get(int(mask), (1, 1, 0))  # 반드시 int(mask)로!
+        if int(mask) == 1:
+            color = (0, 1, 0)  # 실제 박스는 초록색
+        else:
+            color = kf_colors[(int(mask)-2) % len(kf_colors)]  # 칼만필터 박스는 차량별로 다른 색
         aabbs.extend(bbx2linset(box[np.newaxis, :], order, color=color))
     visualize_elements = [o3d_pcd] + aabbs
     if visualize:
