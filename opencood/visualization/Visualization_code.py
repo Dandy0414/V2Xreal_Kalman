@@ -5,6 +5,7 @@ import glob
 import os
 import yaml
 import random
+import pandas as pd
 
 from opencood.utils.pcd_utils import load_lidar_bin
 from opencood.utils.transformation_utils import x_to_world
@@ -249,40 +250,122 @@ class DummyDataset(Dataset):
 if __name__ == "__main__":
     # mode: 1=정답만, 2=칼만만, 3=둘 다, 4=IoU 출력 모드
     mode = 4
+    
     dataset = DummyDataset(
         lidar_folder, vehicle_id=vehicle_ID, mode=mode,
         noise_std=0.05, big_noise_std=0.4, big_noise_prob=0.05
     )
-    dummy_loader = DataLoader(dataset, batch_size=1)
+    
+    # 프레임 수 확인
+    num_frames = len(dataset)
+    print(f"Total frames in dataset: {num_frames}\n")
+    
+    # DataLoader 설정 (shuffle=False, batch_size=1)
+    dummy_loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
 
     # mode 4에서는 시각화 대신 IoU 계산
-    if mode == 3:
+    if mode == 4:
         print("=== IoU Evaluation Mode (no visualization) ===\n")
-        iou_results = []
+        detailed_results = []  # 프레임별 상세 정보
+        vehicle_ious = {}  # 차량별 IOU 수집용
+
+        import time
+        start_time = time.time()
 
         for frame_idx, batch in enumerate(dummy_loader):
+            # 진행도 바 출력
+            progress = (frame_idx + 1) / num_frames
+            bar_length = 40
+            filled = int(bar_length * progress)
+            bar = '█' * filled + '░' * (bar_length - filled)
+            percent = progress * 100
+            
             ego_data = batch['ego']
             boxes = ego_data['object_bbx_center'][0].numpy()  # (N, 7)
             masks = ego_data['object_bbx_mask'][0].numpy()    # (N,)
 
-            frame_ious = []
             # boxes에는 GT와 KF 박스가 순서대로 들어있음 (mode=3과 동일 구조)
             for i in range(0, len(boxes), 2):
                 if i + 1 < len(boxes):
                     gt_box = boxes[i]
                     kf_box = boxes[i + 1]
                     iou = iou_2d_from_bboxes(kf_box, gt_box)
-                    frame_ious.append(iou)
-                    print(f"[Frame {frame_idx:03d}] Object {int(masks[i+1]-2):02d} IoU: {iou:.4f}")
+                    
+                    vehicle_id = int(masks[i+1] - 2)
+                    
+                    # 차량별 IOU 저장
+                    if vehicle_id not in vehicle_ious:
+                        vehicle_ious[vehicle_id] = {}
+                    vehicle_ious[vehicle_id][frame_idx + 1] = iou
+                    
+                    # 상세 정보 저장 (ID, frame 각각 저장)
+                    detailed_results.append({
+                        'vehicle_id': vehicle_id,
+                        'frame': frame_idx + 1,
+                        'iou': iou
+                    })
+            
+            # 진행도 바 출력
+            progress = (frame_idx + 1) / num_frames
+            bar_length = 40
+            filled = int(bar_length * progress)
+            bar = '█' * filled + '░' * (bar_length - filled)
+            percent = progress * 100
+            print(f"\r[{bar}] {percent:.1f}% ({frame_idx + 1}/{num_frames})", end="", flush=True)
 
-            if frame_ious:
-                avg_iou = np.mean(frame_ious)
-                iou_results.append(avg_iou)
-                print(f"  → Average IoU (frame {frame_idx}): {avg_iou:.4f}")
-
-        if iou_results:
+        elapsed_total = time.time() - start_time
+        print("\n")  # 줄 바꿈
+        
+        if detailed_results:
+            # 화면 출력 - 전체 통계
             print("\n=== Overall IoU Summary ===")
-            print(f"Average IoU over {len(iou_results)} frames: {np.mean(iou_results):.4f}")
+            all_ious = [item['iou'] for item in detailed_results]
+            print(f"Total samples processed: {len(all_ious)}")
+            print(f"Average IoU (all samples): {np.mean(all_ious):.4f}")
+            print(f"Min IoU: {np.min(all_ious):.4f}")
+            print(f"Max IoU: {np.max(all_ious):.4f}")
+            print(f"Std IoU: {np.std(all_ious):.4f}")
+            print(f"Processing time: {elapsed_total:.2f}s")
+
+            # 화면 출력 - 차량별 통계
+            print("\n=== Per-Vehicle IoU Summary ===")
+            vehicle_summary = []
+            for vehicle_id in sorted(vehicle_ious.keys()):
+                ious = np.array(list(vehicle_ious[vehicle_id].values()))
+                mean_iou = np.mean(ious)
+                std_iou = np.std(ious)
+                min_iou = np.min(ious)
+                max_iou = np.max(ious)
+                
+                print(f"Vehicle {vehicle_id:02d}: frames={len(ious)}, mean={mean_iou:.4f}, std={std_iou:.4f}, min={min_iou:.4f}, max={max_iou:.4f}")
+                
+                vehicle_summary.append({
+                    'vehicle_id': vehicle_id,
+                    'frame_count': len(ious),
+                    'mean_iou': mean_iou,
+                    'std_iou': std_iou,
+                    'min_iou': min_iou,
+                    'max_iou': max_iou
+                })
+
+            # CSV 저장 (프레임별 상세 정보 - vehicle_id와 frame 각각 저장)
+            df_detailed = pd.DataFrame(detailed_results)
+            df_detailed = df_detailed[['vehicle_id', 'frame', 'iou']]  # 컬럼 순서 재정렬
+            df_detailed.to_csv("iou_detailed_results.csv", index=False)
+
+            # CSV 저장 (2D 형식 - 가로: frame, 세로: vehicle_id)
+            # vehicle_id를 인덱스로, frame을 컬럼으로 하는 피벗 테이블
+            df_pivot = df_detailed.pivot(index='vehicle_id', columns='frame', values='iou')
+            df_pivot.to_csv("iou_2d_results.csv")
+
+            # CSV 저장 (차량별 평균 IOU)
+            df_vehicle_summary = pd.DataFrame(vehicle_summary)
+            df_vehicle_summary.to_csv("iou_vehicle_summary.csv", index=False)
+
+            print("\n✓ CSV 저장 완료:")
+            print("  - iou_detailed_results.csv (vehicle_id | frame | iou)")
+            print("  - iou_2d_results.csv (2D 형식: 세로=vehicle_id, 가로=frame)")
+            print("  - iou_vehicle_summary.csv (차량별 통계)")
 
     else:
         # 기존 시각화 모드
