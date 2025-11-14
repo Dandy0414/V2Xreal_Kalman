@@ -20,6 +20,79 @@ def transform_lidar_to_world(lidar, pose):
     lidar_world = np.hstack([lidar_world[:, :3], lidar[:, 3:4]])  # (N, 4)
     return lidar_world
 
+def iou_2d_from_bboxes(kf_bbox, gt_bbox):
+    """
+    2D IOU (BEV) 계산 — x, y, yaw, length, width 만 사용 (높이 무시)
+    bboxes 형식: [x, y, z, h, w, l, yaw]
+    반환: IOU (float, 0.0 ~ 1.0)
+    """
+    def rect_corners(bbox):
+        x, y, _, h, w, l, yaw = bbox
+        half_l = l / 2.0
+        half_w = w / 2.0
+        local = np.array([
+            [-half_l, -half_w],
+            [ half_l, -half_w],
+            [ half_l,  half_w],
+            [-half_l,  half_w]
+        ], dtype=np.float64)
+        c = np.cos(yaw); s = np.sin(yaw)
+        R = np.array([[c, -s], [s, c]], dtype=np.float64)
+        return (local @ R.T) + np.array([x, y], dtype=np.float64)
+
+    def polygon_area(poly):
+        if poly is None or len(poly) < 3:
+            return 0.0
+        x = poly[:, 0]; y = poly[:, 1]
+        return 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+
+    def is_inside(p, a, b):
+        # p가 a->b 엣지의 왼쪽(내부)인지 판정 (크로스프로덕트)
+        return ((b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])) >= 0
+
+    def intersection_point(s, e, a, b):
+        # 선분 s->e 와 a->b의 교점 (병렬이면 e 반환)
+        x1, y1 = s; x2, y2 = e; x3, y3 = a; x4, y4 = b
+        denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+        if abs(denom) < 1e-9:
+            return e.copy()
+        px = ((x1*y2 - y1*x2)*(x3 - x4) - (x1 - x2)*(x3*y4 - y3*x4)) / denom
+        py = ((x1*y2 - y1*x2)*(y3 - y4) - (y1 - y2)*(x3*y4 - y3*x4)) / denom
+        return np.array([px, py], dtype=np.float64)
+
+    def sutherland_hodgman(subject, clipper):
+        # subject poly를 clipper poly로 클리핑 (둘 다 볼록 다각형)
+        output = subject.tolist()
+        for i in range(len(clipper)):
+            input_list = output
+            output = []
+            if not input_list:
+                break
+            A = clipper[i]; B = clipper[(i + 1) % len(clipper)]
+            S = np.array(input_list[-1])
+            for E_pt in input_list:
+                E = np.array(E_pt)
+                if is_inside(E, A, B):
+                    if not is_inside(S, A, B):
+                        output.append(intersection_point(S, E, A, B))
+                    output.append(E)
+                elif is_inside(S, A, B):
+                    output.append(intersection_point(S, E, A, B))
+                S = E
+        return np.array(output, dtype=np.float64)
+
+    poly1 = rect_corners(kf_bbox)
+    poly2 = rect_corners(gt_bbox)
+
+    area1 = polygon_area(poly1)
+    area2 = polygon_area(poly2)
+    inter_poly = sutherland_hodgman(poly1, poly2)
+    inter_area = polygon_area(inter_poly)
+
+    union = area1 + area2 - inter_area
+    if union <= 1e-9:
+        return 0.0
+    return float(inter_area / union)
 
 class KalmanFilter:
     def __init__(self, init_state, dt=0.1):
@@ -156,11 +229,11 @@ class DummyDataset(Dataset):
             elif self.mode == 2:  # 칼만만
                 all_boxes.append(kf_box)
                 all_masks.append(int(vid)+2)
-            elif self.mode == 3:  # 둘 다
+            elif self.mode in [3, 4]:  # 둘 다 (GT + KF)
                 all_boxes.append(bbox)
                 all_masks.append(1)
                 all_boxes.append(kf_box)
-                all_masks.append(int(vid)+2)
+                all_masks.append(int(vid) + 2)
 
         all_boxes = np.stack(all_boxes, axis=0)
         all_masks = np.array(all_masks, dtype=np.int32)
@@ -174,13 +247,43 @@ class DummyDataset(Dataset):
         }
 
 if __name__ == "__main__":
-    # mode: 1=정답만, 2=칼만만, 3=둘다
-    mode = 2
-    dummy_loader = DataLoader(
-        DummyDataset(
-            lidar_folder, vehicle_id=vehicle_ID, mode=mode,
-            noise_std=0.05, big_noise_std=0.4, big_noise_prob=0.05
-            # noise_std=0, big_noise_std=0, big_noise_prob=0
+    # mode: 1=정답만, 2=칼만만, 3=둘 다, 4=IoU 출력 모드
+    mode = 4
+    dataset = DummyDataset(
+        lidar_folder, vehicle_id=vehicle_ID, mode=mode,
+        noise_std=0.05, big_noise_std=0.4, big_noise_prob=0.05
+    )
+    dummy_loader = DataLoader(dataset, batch_size=1)
 
-        ), batch_size=1)
-    visualize_sequence_dataloader(dummy_loader, order='hwl', color_mode='constant')
+    # mode 4에서는 시각화 대신 IoU 계산
+    if mode == 3:
+        print("=== IoU Evaluation Mode (no visualization) ===\n")
+        iou_results = []
+
+        for frame_idx, batch in enumerate(dummy_loader):
+            ego_data = batch['ego']
+            boxes = ego_data['object_bbx_center'][0].numpy()  # (N, 7)
+            masks = ego_data['object_bbx_mask'][0].numpy()    # (N,)
+
+            frame_ious = []
+            # boxes에는 GT와 KF 박스가 순서대로 들어있음 (mode=3과 동일 구조)
+            for i in range(0, len(boxes), 2):
+                if i + 1 < len(boxes):
+                    gt_box = boxes[i]
+                    kf_box = boxes[i + 1]
+                    iou = iou_2d_from_bboxes(kf_box, gt_box)
+                    frame_ious.append(iou)
+                    print(f"[Frame {frame_idx:03d}] Object {int(masks[i+1]-2):02d} IoU: {iou:.4f}")
+
+            if frame_ious:
+                avg_iou = np.mean(frame_ious)
+                iou_results.append(avg_iou)
+                print(f"  → Average IoU (frame {frame_idx}): {avg_iou:.4f}")
+
+        if iou_results:
+            print("\n=== Overall IoU Summary ===")
+            print(f"Average IoU over {len(iou_results)} frames: {np.mean(iou_results):.4f}")
+
+    else:
+        # 기존 시각화 모드
+        visualize_sequence_dataloader(dummy_loader, order='hwl', color_mode='constant')
