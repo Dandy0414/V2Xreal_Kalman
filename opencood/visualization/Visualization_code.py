@@ -10,7 +10,11 @@ import pandas as pd
 from opencood.utils.pcd_utils import load_lidar_bin
 from opencood.utils.transformation_utils import x_to_world
 
-lidar_folder = 'd:/데이터파일/OPV2V/test/testoutput_CAV_data_2022-03-21-09-35-07_7/1'
+# 경로 입력 (역슬래시 자동 변환)
+lidar_folder = r'D:\데이터파일\BIN\test\2023-04-04-14-34-53_51_1\2'
+# 또는 os.path.normpath() 사용
+lidar_folder = os.path.normpath(lidar_folder)
+
 vehicle_ID = None  # None이면 전체 차량, 특정 ID를 지정하면 해당 차량만
 
 def transform_lidar_to_world(lidar, pose):
@@ -104,7 +108,7 @@ class KalmanFilter:
         self.A = np.eye(8)
         for i in range(4):
             self.A[i, i+4] = dt  # 위치/방향에 속도/각속도 반영
-        self.Q = np.eye(8) * 0.1  # 프로세스 노이즈
+        self.Q = np.eye(8) * 10 # 프로세스 노이즈
         self.H = np.eye(4, 8)      # 관측 행렬 (x, y, z, yaw만 관측)
         self.R = np.eye(4) * 1   # 관측 노이즈
         self.R[3, 3] = 5
@@ -120,19 +124,25 @@ class KalmanFilter:
         self.P = (np.eye(8) - K @ self.H) @ self.P
 
 
-def get_all_vehicle_bboxes(yaml_path, vehicle_id=None, noise_std=0.05, big_noise_std=0.4, big_noise_prob=0.05):
+def get_all_vehicle_bboxes(yaml_path, vehicle_id=None, noise_std=0.05, big_noise_std=0.4, big_noise_prob=0.05, add_noise_flag=True):
+    """
+    add_noise_flag=True: 노이즈 추가 (관측값 시뮬레이션)
+    add_noise_flag=False: 순수 정답지 (노이즈 없음)
+    """
     with open(yaml_path, 'r') as f:
         data = yaml.load(f, Loader=yaml.UnsafeLoader) 
     vehicles = data.get('vehicles', {})
     bboxes = {}
+    
     def add_noise(bbox):
+        if not add_noise_flag:  # 노이즈 추가 안 함
+            return bbox
         bbox[:3] += np.random.normal(0, noise_std, 3)
         bbox[6] += np.random.normal(0, noise_std)
-        # 각 상태변수별로 big_noise_prob 확률로 큰 노이즈 추가
-        for i in range(3):  # x, y, z
+        for i in range(3):
             if random.random() < big_noise_prob:
                 bbox[i] += np.random.normal(0, big_noise_std)*2
-        if random.random() < big_noise_prob:  # yaw
+        if random.random() < big_noise_prob:
             bbox[6] += np.random.normal(0, big_noise_std)
         return bbox
 
@@ -148,7 +158,8 @@ def get_all_vehicle_bboxes(yaml_path, vehicle_id=None, noise_std=0.05, big_noise
         l, w, h = veh['extent']
         yaw = np.deg2rad(veh['angle'][1])
         bbox = np.array([x, y, z, 2*h, 2*w, 2*l, yaw], dtype=np.float32)
-        bbox = add_noise(bbox)
+        if add_noise_flag:
+            bbox = add_noise(bbox)
         bboxes[vid_str] = bbox
     else:
         for vid, veh in vehicles.items():
@@ -156,30 +167,40 @@ def get_all_vehicle_bboxes(yaml_path, vehicle_id=None, noise_std=0.05, big_noise
             l, w, h = veh['extent']
             yaw = np.deg2rad(veh['angle'][1])
             bbox = np.array([x, y, z, 2*h, 2*w, 2*l, yaw], dtype=np.float32)
-            bbox = add_noise(bbox)
+            if add_noise_flag:
+                bbox = add_noise(bbox)
             bboxes[str(vid)] = bbox
     return bboxes  # {vehicle_id: bbox, ...}
 
 # DummyDataset에서 mode 4, 5 관련 코드는 모두 삭제
 class DummyDataset(Dataset):
-    def __init__(self, folder, vehicle_id=None, mode=3, noise_std=0.05, big_noise_std=0.4, big_noise_prob=0.05):
+    def __init__(self, folder, vehicle_id=None, mode=3, noise_std=0.05, big_noise_std=0.4, big_noise_prob=0.05, use_obs_as_gt=False):
         self.bin_files = sorted(glob.glob(os.path.join(folder, '*.bin')))
         self.pcd_files = sorted(glob.glob(os.path.join(folder, '*.pcd')))
         self.yaml_files = sorted(glob.glob(os.path.join(folder, '*.yaml')))
         self.vehicle_id = vehicle_id
         self.mode = mode  # 1: 정답만, 2: 칼만만, 3: 둘 다
+        self.use_obs_as_gt = use_obs_as_gt  # mode==3일 때 GT 대신 관측값 사용 여부
         self.noise_std = noise_std
         self.big_noise_std = big_noise_std
         self.big_noise_prob = big_noise_prob
         self.files = self.bin_files + self.pcd_files
         self.files.sort()
-        first_bboxes = get_all_vehicle_bboxes(
-            self.yaml_files[0], vehicle_id, self.noise_std, self.big_noise_std, self.big_noise_prob)
-        self.vehicle_ids = list(first_bboxes.keys())
+        
+        # 정답지 (노이즈 없음)
+        first_bboxes_gt = get_all_vehicle_bboxes(
+            self.yaml_files[0], vehicle_id, self.noise_std, self.big_noise_std, self.big_noise_prob, add_noise_flag=False)
+        
+        # 관측값 (노이즈 있음) - 칼만필터 초기화용
+        first_bboxes_obs = get_all_vehicle_bboxes(
+            self.yaml_files[0], vehicle_id, self.noise_std, self.big_noise_std, self.big_noise_prob, add_noise_flag=True)
+        
+        self.vehicle_ids = list(first_bboxes_gt.keys())
         self.kf_dict = {}
         self.size_dict = {}
-        for vid, bbox in first_bboxes.items():
-            x, y, z, h, w, l, yaw = bbox
+        for vid, bbox_gt in first_bboxes_gt.items():
+            bbox_obs = first_bboxes_obs[vid]
+            x, y, z, h, w, l, yaw = bbox_obs
             self.kf_dict[vid] = KalmanFilter([x, y, z, yaw, 0, 0, 0, 0])
             self.size_dict[vid] = (h, w, l)
 
@@ -205,35 +226,49 @@ class DummyDataset(Dataset):
         pose = data.get('true_ego_pose', None)
         if pose is not None:
             lidar = transform_lidar_to_world(lidar, pose)
-        bboxes = get_all_vehicle_bboxes(
-            self.yaml_files[yaml_idx], self.vehicle_id, self.noise_std, self.big_noise_std, self.big_noise_prob)
+        
+        # 정답지 (노이즈 없음)
+        bboxes_gt = get_all_vehicle_bboxes(
+            self.yaml_files[yaml_idx], self.vehicle_id, self.noise_std, self.big_noise_std, self.big_noise_prob, add_noise_flag=False)
+        
+        # 관측값 (노이즈 있음)
+        bboxes_obs = get_all_vehicle_bboxes(
+            self.yaml_files[yaml_idx], self.vehicle_id, self.noise_std, self.big_noise_std, self.big_noise_prob, add_noise_flag=True)
 
         all_boxes = []
         all_masks = []
-        for i, (vid, bbox) in enumerate(bboxes.items()):
+        for vid, bbox_gt in bboxes_gt.items():
+            bbox_obs = bboxes_obs[vid]
             kf = self.kf_dict.get(vid)
             if kf is None:
-                x, y, z, h, w, l, yaw = bbox
+                x, y, z, h, w, l, yaw = bbox_obs
                 kf = KalmanFilter([x, y, z, yaw, 0, 0, 0, 0])
                 self.kf_dict[vid] = kf
                 self.size_dict[vid] = (h, w, l)
+            
             pred_state = kf.predict()
-            obs = np.array([bbox[0], bbox[1], bbox[2], bbox[6]], dtype=np.float32)
+            obs = np.array([bbox_obs[0], bbox_obs[1], bbox_obs[2], bbox_obs[6]], dtype=np.float32)
             kf.update(obs)
             est_state = kf.x[:4]
             h, w, l = self.size_dict[vid]
             kf_box = np.array([est_state[0], est_state[1], est_state[2], h, w, l, est_state[3]], dtype=np.float32)
 
-            if self.mode == 1:  # 정답만
-                all_boxes.append(bbox)
+            if self.mode == 1:
+                all_boxes.append(bbox_gt)  # 정답지만
                 all_masks.append(1)
-            elif self.mode == 2:  # 칼만만
-                all_boxes.append(kf_box)
+            elif self.mode == 2:
+                all_boxes.append(kf_box)  # 칼만만
                 all_masks.append(int(vid)+2)
-            elif self.mode in [3, 4]:  # 둘 다 (GT + KF)
-                all_boxes.append(bbox)
-                all_masks.append(1)
-                all_boxes.append(kf_box)
+            elif self.mode in [3, 4]:
+                # mode 3에서 use_obs_as_gt=True일 때 관측값(노이즈 있음) 사용
+                if self.use_obs_as_gt:
+                    all_boxes.append(bbox_obs)   # 관측값 (노이즈 있음)
+                    all_masks.append(int(vid) + 2)
+                else:
+                    all_boxes.append(bbox_gt)   # 정답지 (노이즈 없음)
+                    all_masks.append(1)
+                
+                all_boxes.append(kf_box)    # 칼만 필터 결과
                 all_masks.append(int(vid) + 2)
 
         all_boxes = np.stack(all_boxes, axis=0)
@@ -246,14 +281,19 @@ class DummyDataset(Dataset):
                 'object_bbx_mask': all_masks
             }
         }
-
+ 
 if __name__ == "__main__":
     # mode: 1=정답만, 2=칼만만, 3=둘 다, 4=IoU 출력 모드
-    mode = 4
+    mode = 3
+    
+    # use_obs_as_gt=True일 때: 정답지 대신 관측값(노이즈 있음) 표시
+    # use_obs_as_gt=False일 때: 정답지(노이즈 없음) 표시
+    use_obs_as_gt = False  # True로 변경하면 관측값 표시
     
     dataset = DummyDataset(
         lidar_folder, vehicle_id=vehicle_ID, mode=mode,
-        noise_std=0.05, big_noise_std=0.4, big_noise_prob=0.05
+        noise_std=0.1, big_noise_std=0.2, big_noise_prob=0.01,
+        use_obs_as_gt=use_obs_as_gt
     )
     
     # 프레임 수 확인
@@ -347,6 +387,14 @@ if __name__ == "__main__":
                     'min_iou': min_iou,
                     'max_iou': max_iou
                 })
+
+            # 차량 1번의 평균 IOU 출력
+            if 1 in vehicle_ious:
+                vehicle_1_ious = np.array(list(vehicle_ious[1].values()))
+                vehicle_1_mean_iou = np.mean(vehicle_1_ious)
+                print(f"\n*** Vehicle 1 Mean IOU: {vehicle_1_mean_iou:.4f} ***")
+            else:
+                print("\n*** Vehicle 1 not found in dataset ***")
 
             # CSV 저장 (프레임별 상세 정보 - vehicle_id와 frame 각각 저장)
             df_detailed = pd.DataFrame(detailed_results)
