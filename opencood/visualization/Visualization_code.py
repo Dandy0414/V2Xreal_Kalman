@@ -11,7 +11,7 @@ from opencood.utils.pcd_utils import load_lidar_bin
 from opencood.utils.transformation_utils import x_to_world
 
 # 경로 입력 (역슬래시 자동 변환)
-lidar_folder = r'D:\데이터파일\BIN\test\2023-04-04-14-34-53_51_1\2'
+lidar_folder = r'D:\데이터파일\OPV2V\test\testoutput_CAV_data_2022-03-17-11-02-23_2\1'
 # 또는 os.path.normpath() 사용
 lidar_folder = os.path.normpath(lidar_folder)
 
@@ -99,28 +99,121 @@ def iou_2d_from_bboxes(kf_bbox, gt_bbox):
         return 0.0
     return float(inter_area / union)
 
+class ExtendedKalmanFilter:
+    """
+    EKF using bicycle (kinematic) model:
+      x += v * cos(yaw) * dt
+      y += v * sin(yaw) * dt
+      yaw += (v / L) * tan(delta) * dt
+    State: [x, y, yaw, v, delta]
+    Measurements: [x, y, yaw]
+    """
+    def __init__(self, init_state, dt=0.1, L=2.5):
+        # init_state must be length 5: [x, y, yaw, v, delta]
+        self.dt = dt
+        self.L = L
+        self.x = np.array(init_state, dtype=np.float64)
+        # normalize yaw
+        self.x[2] = np.arctan2(np.sin(self.x[2]), np.cos(self.x[2]))
+        self.P = np.eye(5) * 1.0
+        self.Q = np.diag([0.1, 0.1, 0.1, 0.1, 0.1])  # tune as needed
+        self.R = np.diag([1, 1, 1.0])             # measurement noise
+
+    def _normalize_angle(self, a):
+        return np.arctan2(np.sin(a), np.cos(a))
+
+    def _f(self, x):
+        x_new = x.copy()
+        yaw = x[2]; v = x[3]; delta = x[4]
+        dt = self.dt; L = self.L
+        x_new[0] = x[0] + v * np.cos(yaw) * dt
+        x_new[1] = x[1] + v * np.sin(yaw) * dt
+        x_new[2] = x[2] + (v / L) * np.tan(delta) * dt
+        x_new[2] = self._normalize_angle(x_new[2])
+        # keep v, delta (could add simple dynamics if desired)
+        return x_new
+
+    def _F_jacobian(self, x):
+        yaw = x[2]; v = x[3]; delta = x[4]
+        dt = self.dt; L = self.L
+        F = np.eye(5, dtype=np.float64)
+        # partials for x
+        F[0,2] = -v * np.sin(yaw) * dt
+        F[0,3] =  np.cos(yaw) * dt
+        # partials for y
+        F[1,2] =  v * np.cos(yaw) * dt
+        F[1,3] =  np.sin(yaw) * dt
+        # partials for yaw
+        F[2,3] = (1.0 / L) * np.tan(delta) * dt
+        F[2,4] = (v / L) * (1.0 / (np.cos(delta) ** 2)) * dt
+        return F
+
+    def _h(self, x):
+        # measurement function: observe x, y, yaw
+        return np.array([x[0], x[1], x[2]], dtype=np.float64)
+
+    def _H_jacobian(self, x):
+        H = np.zeros((3, 5), dtype=np.float64)
+        H[0, 0] = 1.0
+        H[1, 1] = 1.0
+        H[2, 2] = 1.0
+        return H
+
+    def predict(self):
+        # predict state
+        self.x = self._f(self.x)
+        F = self._F_jacobian(self.x)
+        self.P = F @ self.P @ F.T + self.Q
+        return self._h(self.x)
+
+    def update(self, z):
+        # z: [x, y, yaw]
+        z = np.array(z, dtype=np.float64)
+        z_pred = self._h(self.x)
+        y = z - z_pred
+        # normalize yaw residual
+        y[2] = self._normalize_angle(y[2])
+        H = self._H_jacobian(self.x)
+        S = H @ self.P @ H.T + self.R
+        K = self.P @ H.T @ np.linalg.inv(S)
+        self.x = self.x + K @ y
+        self.x[2] = self._normalize_angle(self.x[2])
+        self.P = (np.eye(5) - K @ H) @ self.P
+
+
 class KalmanFilter:
     def __init__(self, init_state, dt=0.1):
         # 상태: [x, y, z, yaw, vx, vy, vz, vyaw]
         self.dt = dt
         self.x = np.array(init_state, dtype=np.float32)  # 초기 상태
+        # normalize yaw 초기값
+        self.x[3] = np.arctan2(np.sin(self.x[3]), np.cos(self.x[3]))
         self.P = np.eye(8) * 1.0  # 오차 공분산
         self.A = np.eye(8)
         for i in range(4):
             self.A[i, i+4] = dt  # 위치/방향에 속도/각속도 반영
-        self.Q = np.eye(8) * 10 # 프로세스 노이즈
+        self.Q = np.eye(8) * 0.1 # 프로세스 노이즈
         self.H = np.eye(4, 8)      # 관측 행렬 (x, y, z, yaw만 관측)
         self.R = np.eye(4) * 1   # 관측 노이즈
         self.R[3, 3] = 5
 
     def predict(self):
         self.x = self.A @ self.x
+        # yaw 정규화 (예측 후)
+        self.x[3] = np.arctan2(np.sin(self.x[3]), np.cos(self.x[3]))
         self.P = self.A @ self.P @ self.A.T + self.Q
         return self.x[:4]  # [x, y, z, yaw]
 
     def update(self, z):
-        K = self.P @ self.H.T @ np.linalg.inv(self.H @ self.P @ self.H.T + self.R)
-        self.x = self.x + K @ (z - self.H @ self.x)
+        # 선형 잔차 계산
+        y = z - (self.H @ self.x)
+        # yaw 잔차 정규화 -> 큰 꺾임 방지
+        y[3] = np.arctan2(np.sin(y[3]), np.cos(y[3]))
+        S = self.H @ self.P @ self.H.T + self.R
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+        self.x = self.x + K @ y
+        # 업데이트 후 yaw 정규화
+        self.x[3] = np.arctan2(np.sin(self.x[3]), np.cos(self.x[3]))
         self.P = (np.eye(8) - K @ self.H) @ self.P
 
 
@@ -174,13 +267,14 @@ def get_all_vehicle_bboxes(yaml_path, vehicle_id=None, noise_std=0.05, big_noise
 
 # DummyDataset에서 mode 4, 5 관련 코드는 모두 삭제
 class DummyDataset(Dataset):
-    def __init__(self, folder, vehicle_id=None, mode=3, noise_std=0.05, big_noise_std=0.4, big_noise_prob=0.05, use_obs_as_gt=False):
+    def __init__(self, folder, vehicle_id=None, mode=3, noise_std=0.05, big_noise_std=0.4, big_noise_prob=0.05, use_obs_as_gt=False, use_ekf=False):
         self.bin_files = sorted(glob.glob(os.path.join(folder, '*.bin')))
         self.pcd_files = sorted(glob.glob(os.path.join(folder, '*.pcd')))
         self.yaml_files = sorted(glob.glob(os.path.join(folder, '*.yaml')))
         self.vehicle_id = vehicle_id
         self.mode = mode  # 1: 정답만, 2: 칼만만, 3: 둘 다
         self.use_obs_as_gt = use_obs_as_gt  # mode==3일 때 GT 대신 관측값 사용 여부
+        self.use_ekf = use_ekf  # EKF 사용 여부
         self.noise_std = noise_std
         self.big_noise_std = big_noise_std
         self.big_noise_prob = big_noise_prob
@@ -201,7 +295,14 @@ class DummyDataset(Dataset):
         for vid, bbox_gt in first_bboxes_gt.items():
             bbox_obs = first_bboxes_obs[vid]
             x, y, z, h, w, l, yaw = bbox_obs
-            self.kf_dict[vid] = KalmanFilter([x, y, z, yaw, 0, 0, 0, 0])
+            
+            if self.use_ekf:
+                # EKF 초기화 (bicycle model state: [x, y, yaw, v, delta])
+                self.kf_dict[vid] = ExtendedKalmanFilter([x, y, yaw, 0.0, 0.0])
+            else:
+                # 선형 칼만필터 초기화
+                self.kf_dict[vid] = KalmanFilter([x, y, z, yaw, 0, 0, 0, 0])
+            
             self.size_dict[vid] = (h, w, l)
 
     def __len__(self):
@@ -242,16 +343,30 @@ class DummyDataset(Dataset):
             kf = self.kf_dict.get(vid)
             if kf is None:
                 x, y, z, h, w, l, yaw = bbox_obs
-                kf = KalmanFilter([x, y, z, yaw, 0, 0, 0, 0])
+                if self.use_ekf:
+                    # EKF expects [x, y, yaw, v, delta]
+                    kf = ExtendedKalmanFilter([x, y, yaw, 0.0, 0.0])
+                else:
+                    kf = KalmanFilter([x, y, z, yaw, 0, 0, 0, 0])
                 self.kf_dict[vid] = kf
                 self.size_dict[vid] = (h, w, l)
             
             pred_state = kf.predict()
-            obs = np.array([bbox_obs[0], bbox_obs[1], bbox_obs[2], bbox_obs[6]], dtype=np.float32)
-            kf.update(obs)
-            est_state = kf.x[:4]
-            h, w, l = self.size_dict[vid]
-            kf_box = np.array([est_state[0], est_state[1], est_state[2], h, w, l, est_state[3]], dtype=np.float32)
+            
+            if self.use_ekf:
+                # EKF: 관측값 (x, y, yaw)
+                obs = np.array([bbox_obs[0], bbox_obs[1], bbox_obs[6]], dtype=np.float32)
+                kf.update(obs)
+                est_state = kf.x[:3]  # [x, y, yaw]
+                h, w, l = self.size_dict[vid]
+                kf_box = np.array([est_state[0], est_state[1], bbox_obs[2], h, w, l, est_state[2]], dtype=np.float32)
+            else:
+                # 선형 칼만필터: 관측값 (x, y, z, yaw)
+                obs = np.array([bbox_obs[0], bbox_obs[1], bbox_obs[2], bbox_obs[6]], dtype=np.float32)
+                kf.update(obs)
+                est_state = kf.x[:4]
+                h, w, l = self.size_dict[vid]
+                kf_box = np.array([est_state[0], est_state[1], est_state[2], h, w, l, est_state[3]], dtype=np.float32)
 
             if self.mode == 1:
                 all_boxes.append(bbox_gt)  # 정답지만
@@ -260,15 +375,15 @@ class DummyDataset(Dataset):
                 all_boxes.append(kf_box)  # 칼만만
                 all_masks.append(int(vid)+2)
             elif self.mode in [3, 4]:
-                # mode 3에서 use_obs_as_gt=True일 때 관측값(노이즈 있음) 사용
+                # 간단 처리: use_obs_as_gt=True이면 '관측값'을 정답지(마스크=1)처럼 표시
                 if self.use_obs_as_gt:
                     all_boxes.append(bbox_obs)   # 관측값 (노이즈 있음)
-                    all_masks.append(int(vid) + 2)
+                    all_masks.append(1)          # 정답지와 동일한 마스크(초록색으로 표시되는 기존 동작 재사용)
                 else:
-                    all_boxes.append(bbox_gt)   # 정답지 (노이즈 없음)
+                    all_boxes.append(bbox_gt)    # 정답지 (노이즈 없음)
                     all_masks.append(1)
                 
-                all_boxes.append(kf_box)    # 칼만 필터 결과
+                all_boxes.append(kf_box)    # 칼만/EKF 필터 결과
                 all_masks.append(int(vid) + 2)
 
         all_boxes = np.stack(all_boxes, axis=0)
@@ -284,16 +399,20 @@ class DummyDataset(Dataset):
  
 if __name__ == "__main__":
     # mode: 1=정답만, 2=칼만만, 3=둘 다, 4=IoU 출력 모드
-    mode = 3
+    mode = 4
     
     # use_obs_as_gt=True일 때: 정답지 대신 관측값(노이즈 있음) 표시
     # use_obs_as_gt=False일 때: 정답지(노이즈 없음) 표시
-    use_obs_as_gt = False  # True로 변경하면 관측값 표시
+    use_obs_as_gt = True
+    
+    # EKF 사용 여부 (True: EKF 사용, False: 선형 칼만필터 사용)
+    use_ekf = True
     
     dataset = DummyDataset(
         lidar_folder, vehicle_id=vehicle_ID, mode=mode,
-        noise_std=0.1, big_noise_std=0.2, big_noise_prob=0.01,
-        use_obs_as_gt=use_obs_as_gt
+        noise_std=0.05, big_noise_std=0.2, big_noise_prob=0.01,
+        use_obs_as_gt=use_obs_as_gt,
+        use_ekf=use_ekf  # ← EKF 옵션
     )
     
     # 프레임 수 확인
